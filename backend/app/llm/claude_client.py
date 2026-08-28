@@ -15,7 +15,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from app.core.exceptions import LLMProviderError
 from app.core.logging import get_logger
-from app.models.schemas import RetrievedChunk, SourceType
+from app.models.schemas import ConversationTurn, RetrievedChunk, SourceType
 
 logger = get_logger(__name__)
 
@@ -86,27 +86,45 @@ class ClaudeClient:
         self._model = model
         self._max_tokens = max_tokens
 
+    @staticmethod
+    def _build_messages(
+        query: str, context_chunks: list[RetrievedChunk], history: list[ConversationTurn] | None
+    ) -> list[dict]:
+        """Prior turns carry the plain question/answer text, not the
+        context blob that was assembled for that turn — the thread of
+        conversation matters for follow-ups, but re-sending old retrieved
+        context on every turn would grow tokens unboundedly for no benefit.
+        Only the *current* question gets fresh context."""
+        messages = [{"role": t["role"], "content": t["content"]} for t in (history or [])]
+        messages.append({"role": "user", "content": build_user_message(query, context_chunks)})
+        return messages
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
-    async def _call(self, user_message: str) -> tuple[str, int, int]:
+    async def _call(self, messages: list[dict]) -> tuple[str, int, int]:
         response = await self._client.messages.create(
             model=self._model,
             max_tokens=self._max_tokens,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
+            messages=messages,
         )
         answer = "".join(block.text for block in response.content if block.type == "text")
         return answer, response.usage.input_tokens, response.usage.output_tokens
 
-    async def answer(self, query: str, context_chunks: list[RetrievedChunk]) -> dict:
-        user_message = build_user_message(query, context_chunks)
+    async def answer(
+        self,
+        query: str,
+        context_chunks: list[RetrievedChunk],
+        history: list[ConversationTurn] | None = None,
+    ) -> dict:
+        messages = self._build_messages(query, context_chunks, history)
         start = time.perf_counter()
         try:
-            answer_text, input_tokens, output_tokens = await self._call(user_message)
+            answer_text, input_tokens, output_tokens = await self._call(messages)
         except Exception as exc:
             logger.error("claude_call_failed", error=str(exc))
             raise LLMProviderError("The Claude API call failed after retries.") from exc
@@ -122,5 +140,51 @@ class ClaudeClient:
             "answer": answer_text,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "llm_ms": llm_ms,
+        }
+
+    async def stream_answer(
+        self,
+        query: str,
+        context_chunks: list[RetrievedChunk],
+        history: list[ConversationTurn] | None = None,
+    ):
+        """Async generator: yields text deltas as they arrive, then a final
+        dict with the same shape `answer()` returns (used by the SSE route
+        to emit a closing event with usage/timing once the stream ends).
+
+        Deliberately not wrapped in the same retry as `_call` — once partial
+        text has been sent to the client, silently retrying and re-streaming
+        from the top would duplicate output. If the stream fails mid-way,
+        the SSE route below emits an error event instead."""
+        messages = self._build_messages(query, context_chunks, history)
+        start = time.perf_counter()
+        try:
+            async with self._client.messages.stream(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                system=SYSTEM_PROMPT,
+                messages=messages,
+            ) as stream:
+                async for text in stream.text_stream:
+                    yield {"type": "delta", "text": text}
+                final_message = await stream.get_final_message()
+        except Exception as exc:
+            logger.error("claude_stream_failed", error=str(exc))
+            raise LLMProviderError("The Claude API streaming call failed.") from exc
+
+        llm_ms = round((time.perf_counter() - start) * 1000, 2)
+        answer_text = "".join(block.text for block in final_message.content if block.type == "text")
+        logger.info(
+            "claude_stream_complete",
+            llm_ms=llm_ms,
+            input_tokens=final_message.usage.input_tokens,
+            output_tokens=final_message.usage.output_tokens,
+        )
+        yield {
+            "type": "done",
+            "answer": answer_text,
+            "input_tokens": final_message.usage.input_tokens,
+            "output_tokens": final_message.usage.output_tokens,
             "llm_ms": llm_ms,
         }

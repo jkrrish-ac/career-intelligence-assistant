@@ -1,8 +1,8 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { AlertTriangle, Loader2, Send, Sparkles } from 'lucide-react'
-import type { ChatResponse, DocumentMetadata } from '../api/types'
+import type { DocumentMetadata, SourceRef, TimingInfo, TokenUsage } from '../api/types'
 import { ApiError } from '../api/types'
-import { sendChatMessage } from '../api/client'
+import { streamChatMessage } from '../api/client'
 import { SourceChip } from './SourceChip'
 import { Button } from './ui/Button'
 
@@ -10,7 +10,11 @@ interface ChatMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
-  response?: ChatResponse
+  sources?: SourceRef[]
+  grounded?: boolean
+  timing?: TimingInfo
+  tokenUsage?: TokenUsage
+  streaming?: boolean
   error?: string
 }
 
@@ -25,33 +29,69 @@ export function ChatPanel({ documents }: { documents: DocumentMetadata[] }) {
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const sessionId = useRef(crypto.randomUUID())
+  const abortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => () => abortRef.current?.abort(), [])
 
   const hasResume = documents.some((d) => d.source_type === 'resume')
   const hasJobDescription = documents.some((d) => d.source_type === 'job_description')
   const canChat = hasResume && hasJobDescription
+
+  function updateAssistantMessage(id: string, patch: Partial<ChatMessage>) {
+    setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)))
+  }
 
   async function handleSend(text: string) {
     const trimmed = text.trim()
     if (!trimmed || loading) return
 
     const userMessage: ChatMessage = { id: crypto.randomUUID(), role: 'user', content: trimmed }
-    setMessages((prev) => [...prev, userMessage])
+    const assistantId = crypto.randomUUID()
+    setMessages((prev) => [
+      ...prev,
+      userMessage,
+      { id: assistantId, role: 'assistant', content: '', streaming: true },
+    ])
     setInput('')
     setLoading(true)
 
+    const controller = new AbortController()
+    abortRef.current = controller
+
     try {
-      const response = await sendChatMessage(trimmed, sessionId.current)
-      setMessages((prev) => [
-        ...prev,
-        { id: crypto.randomUUID(), role: 'assistant', content: response.answer, response },
-      ])
+      await streamChatMessage(
+        trimmed,
+        sessionId.current,
+        (event) => {
+          switch (event.type) {
+            case 'context':
+              updateAssistantMessage(assistantId, { sources: event.sources, grounded: event.grounded })
+              break
+            case 'delta':
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId ? { ...m, content: m.content + event.text } : m,
+                ),
+              )
+              break
+            case 'done':
+              updateAssistantMessage(assistantId, {
+                timing: event.timing,
+                tokenUsage: event.token_usage,
+                streaming: false,
+              })
+              break
+            case 'error':
+              updateAssistantMessage(assistantId, { error: event.message, streaming: false })
+              break
+          }
+        },
+        controller.signal,
+      )
     } catch (err) {
       const message =
         err instanceof ApiError ? err.message : 'Something went wrong reaching the assistant.'
-      setMessages((prev) => [
-        ...prev,
-        { id: crypto.randomUUID(), role: 'assistant', content: '', error: message },
-      ])
+      updateAssistantMessage(assistantId, { error: message, streaming: false })
     } finally {
       setLoading(false)
     }
@@ -60,18 +100,10 @@ export function ChatPanel({ documents }: { documents: DocumentMetadata[] }) {
   return (
     <div className="flex h-full flex-col">
       <div className="flex-1 space-y-4 overflow-y-auto p-4">
-        {messages.length === 0 && (
-          <EmptyState canChat={canChat} onPick={handleSend} />
-        )}
+        {messages.length === 0 && <EmptyState canChat={canChat} onPick={handleSend} />}
         {messages.map((message) => (
           <MessageBubble key={message.id} message={message} />
         ))}
-        {loading && (
-          <div className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            Retrieving context and asking Claude…
-          </div>
-        )}
       </div>
 
       <form
@@ -127,6 +159,8 @@ function EmptyState({ canChat, onPick }: { canChat: boolean; onPick: (text: stri
 
 function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === 'user'
+  const isThinking = message.streaming && !message.content && !message.error
+
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
       <div className={`max-w-[85%] space-y-2 ${isUser ? 'items-end' : 'items-start'}`}>
@@ -144,37 +178,44 @@ function MessageBubble({ message }: { message: ChatMessage }) {
               <AlertTriangle className="h-4 w-4 shrink-0" />
               {message.error}
             </span>
+          ) : isThinking ? (
+            <span className="flex items-center gap-2 text-[var(--color-text-secondary)]">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              Retrieving context and asking Claude…
+            </span>
           ) : (
-            message.content
+            <>
+              {message.content}
+              {message.streaming && <span className="animate-pulse">▍</span>}
+            </>
           )}
         </div>
 
-        {message.response && (
+        {!isUser && !message.error && message.sources && message.sources.length > 0 && (
           <div className="space-y-1.5">
-            {!message.response.grounded && (
+            {message.grounded === false && (
               <p className="text-[10px] text-[var(--color-text-secondary)]">
                 ⚠ Low-confidence match — the documents may not fully cover this question.
               </p>
             )}
-            {message.response.sources.length > 0 && (
-              <div className="space-y-1">
-                <p className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-secondary)]">
-                  Sources
-                </p>
-                <div className="flex flex-col gap-1">
-                  {message.response.sources.map((source, i) => (
-                    <SourceChip key={`${source.document_id}-${i}`} source={source} />
-                  ))}
-                </div>
+            <div className="space-y-1">
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-secondary)]">
+                Sources
+              </p>
+              <div className="flex flex-col gap-1">
+                {message.sources.map((source, i) => (
+                  <SourceChip key={`${source.document_id}-${i}`} source={source} />
+                ))}
               </div>
+            </div>
+            {message.timing && message.tokenUsage && (
+              <p className="font-mono text-[10px] text-[var(--color-text-secondary)]">
+                retrieval {message.timing.retrieval_ms}ms
+                {message.timing.rerank_ms !== null && ` · rerank ${message.timing.rerank_ms}ms`} · llm{' '}
+                {message.timing.llm_ms}ms · {message.tokenUsage.input_tokens}+
+                {message.tokenUsage.output_tokens} tokens
+              </p>
             )}
-            <p className="font-mono text-[10px] text-[var(--color-text-secondary)]">
-              retrieval {message.response.timing.retrieval_ms}ms
-              {message.response.timing.rerank_ms !== null &&
-                ` · rerank ${message.response.timing.rerank_ms}ms`}{' '}
-              · llm {message.response.timing.llm_ms}ms · {message.response.token_usage.input_tokens}+
-              {message.response.token_usage.output_tokens} tokens
-            </p>
           </div>
         )}
       </div>

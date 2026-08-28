@@ -9,8 +9,20 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Literal, TypedDict
 
 from pydantic import BaseModel, Field
+
+ConversationRole = Literal["user", "assistant"]
+
+
+class ConversationTurn(TypedDict):
+    """One turn of session-scoped conversation history (see
+    app/services/conversation_store.py). Plain TypedDict, not a Pydantic
+    model, since it's an internal in-memory shape, not an API contract."""
+
+    role: ConversationRole
+    content: str
 
 
 class SourceType(str, Enum):

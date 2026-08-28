@@ -53,6 +53,33 @@ export interface ApiErrorBody {
   detail: Record<string, unknown>
 }
 
+// --- SSE stream event shapes (POST /chat/stream) ---
+
+export interface StreamContextEvent {
+  type: 'context'
+  sources: SourceRef[]
+  grounded: boolean
+}
+
+export interface StreamDeltaEvent {
+  type: 'delta'
+  text: string
+}
+
+export interface StreamDoneEvent {
+  type: 'done'
+  timing: TimingInfo
+  token_usage: TokenUsage
+}
+
+export interface StreamErrorEvent {
+  type: 'error'
+  error_code: string
+  message: string
+}
+
+export type StreamEvent = StreamContextEvent | StreamDeltaEvent | StreamDoneEvent | StreamErrorEvent
+
 export class ApiError extends Error {
   readonly errorCode: string
   readonly status: number

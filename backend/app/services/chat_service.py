@@ -1,11 +1,12 @@
 """Orchestrates: guardrails -> hybrid retrieve -> rerank -> Claude call ->
-response assembly. This is the "brain" of the /chat endpoint; the route
-itself stays a thin translation to/from HTTP.
+response assembly. This is the "brain" of the /chat endpoints; the routes
+themselves stay a thin translation to/from HTTP (or SSE).
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import AsyncIterator
 
 from app.core.exceptions import NoDocumentsUploadedError
 from app.core.logging import get_logger
@@ -13,6 +14,7 @@ from app.core.rate_limit import SlidingWindowRateLimiter
 from app.llm.claude_client import ClaudeClient
 from app.models.schemas import (
     ChatResponse,
+    ConversationTurn,
     RetrievedChunk,
     SourceRef,
     TimingInfo,
@@ -22,6 +24,7 @@ from app.rag.embeddings import EmbeddingProvider
 from app.rag.reranker import CrossEncoderReranker, rerank_candidates
 from app.rag.retrieval import hybrid_retrieve
 from app.rag.vector_store import VectorStore
+from app.services.conversation_store import ConversationStore
 from app.services.document_registry import DocumentRegistry
 
 logger = get_logger(__name__)
@@ -45,6 +48,7 @@ class ChatService:
         document_registry: DocumentRegistry,
         claude_client: ClaudeClient,
         rate_limiter: SlidingWindowRateLimiter,
+        conversation_store: ConversationStore,
         candidate_k: int,
         final_k: int,
         rerank_enabled: bool,
@@ -55,11 +59,16 @@ class ChatService:
         self._document_registry = document_registry
         self._claude_client = claude_client
         self._rate_limiter = rate_limiter
+        self._conversation_store = conversation_store
         self._candidate_k = candidate_k
         self._final_k = final_k
         self._rerank_enabled = rerank_enabled
 
-    async def answer_question(self, *, message: str, session_id: str | None) -> ChatResponse:
+    async def _prepare_context(
+        self, *, message: str, session_id: str | None
+    ) -> tuple[list[RetrievedChunk], float, float | None, bool]:
+        """Guardrails + hybrid retrieve + rerank — the part identical
+        between the plain and streaming chat paths."""
         self._rate_limiter.check(key=session_id or "anonymous")
 
         known_documents = self._document_registry.list_all()
@@ -98,9 +107,11 @@ class ChatService:
             for c in final_chunks
         )
 
-        llm_result = await self._claude_client.answer(message, final_chunks)
+        return final_chunks, retrieval_ms, rerank_ms, grounded
 
-        sources = [
+    @staticmethod
+    def _to_sources(final_chunks: list[RetrievedChunk]) -> list[SourceRef]:
+        return [
             SourceRef(
                 document_id=c.chunk.document_id,
                 label=c.chunk.label,
@@ -112,16 +123,37 @@ class ChatService:
             for c in final_chunks
         ]
 
+    def _history_for(self, session_id: str | None) -> list[ConversationTurn]:
+        if not session_id:
+            return []
+        return self._conversation_store.get_history(session_id)
+
+    def _record_turn(self, session_id: str | None, question: str, answer: str) -> None:
+        if not session_id:
+            return
+        self._conversation_store.append(session_id, "user", question)
+        self._conversation_store.append(session_id, "assistant", answer)
+
+    async def answer_question(self, *, message: str, session_id: str | None) -> ChatResponse:
+        final_chunks, retrieval_ms, rerank_ms, grounded = await self._prepare_context(
+            message=message, session_id=session_id
+        )
+        history = self._history_for(session_id)
+
+        llm_result = await self._claude_client.answer(message, final_chunks, history)
+        self._record_turn(session_id, message, llm_result["answer"])
+
         logger.info(
             "chat_answered",
             message=message,
             grounded=grounded,
-            source_count=len(sources),
+            source_count=len(final_chunks),
+            history_turns=len(history),
         )
 
         return ChatResponse(
             answer=llm_result["answer"],
-            sources=sources,
+            sources=self._to_sources(final_chunks),
             timing=TimingInfo(
                 retrieval_ms=retrieval_ms,
                 rerank_ms=rerank_ms,
@@ -133,3 +165,45 @@ class ChatService:
             ),
             grounded=grounded,
         )
+
+    async def stream_answer(
+        self, *, message: str, session_id: str | None
+    ) -> AsyncIterator[dict]:
+        """Same pipeline as `answer_question`, but yields incremental
+        events: retrieval metadata first (so the UI can show sources while
+        the answer is still streaming in), then text deltas, then a final
+        event with timing/usage — mirroring ChatResponse's fields so the
+        frontend can assemble the same shape either way."""
+        final_chunks, retrieval_ms, rerank_ms, grounded = await self._prepare_context(
+            message=message, session_id=session_id
+        )
+        history = self._history_for(session_id)
+        sources = self._to_sources(final_chunks)
+
+        yield {"type": "context", "sources": [s.model_dump() for s in sources], "grounded": grounded}
+
+        answer_text = ""
+        async for event in self._claude_client.stream_answer(message, final_chunks, history):
+            if event["type"] == "delta":
+                answer_text += event["text"]
+                yield {"type": "delta", "text": event["text"]}
+            else:  # "done"
+                self._record_turn(session_id, message, event["answer"])
+                logger.info(
+                    "chat_stream_answered",
+                    message=message,
+                    grounded=grounded,
+                    source_count=len(final_chunks),
+                )
+                yield {
+                    "type": "done",
+                    "timing": {
+                        "retrieval_ms": retrieval_ms,
+                        "rerank_ms": rerank_ms,
+                        "llm_ms": event["llm_ms"],
+                    },
+                    "token_usage": {
+                        "input_tokens": event["input_tokens"],
+                        "output_tokens": event["output_tokens"],
+                    },
+                }
