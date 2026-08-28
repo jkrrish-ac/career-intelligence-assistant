@@ -85,12 +85,12 @@ else is injected "for its own sake."
   limiter is the named next step for a real deployment.
 - **Conversation memory** is session-scoped and in-memory only (`ConversationStore`,
   keyed by the frontend's per-tab `session_id`) — prior turns' plain Q&A text
-  is replayed to Claude on each new turn, but old *retrieved context* is not
+  is replayed to Claude on each new turn, but old _retrieved context_ is not
   re-sent, so tokens don't grow unboundedly across a long conversation. Resets
   on backend restart; a real deployment would move this to Redis.
 - **Streaming** (`POST /chat/stream`, SSE) runs the same guardrail →
   retrieve → rerank pipeline as the plain endpoint, then streams Claude's
-  answer token-by-token. Sources arrive in a `context` event *before* the
+  answer token-by-token. Sources arrive in a `context` event _before_ the
   text starts streaming, so the UI can show what's grounding the answer
   while it's still being generated — one retry policy applies to the plain
   endpoint's single call, not the stream (retrying after partial output was
@@ -102,6 +102,22 @@ else is injected "for its own sake."
 See PRD.md §2 for the full list (multi-user auth, cloud deployment, OCR,
 production rate limiting). Nothing here is a forgotten feature — it's a
 named tradeoff given the 2-day budget.
+
+## AI tools in your development process
+
+I started by writing a detailed project instruction that codified my architecture decisions, coding standards, and constraints before writing any application code. This instruction acted as a living spec — Claude operated within it, not outside it.
+
+My workflow was: I decide the what and why, Claude drafts the how, I review and refine. Every architectural choice (no LangChain, FastAPI over Flask, chunking strategy, prompt design) was mine. Claude accelerated implementation.
+
+My rules for AI-assisted development:
+
+Never accept generated code without verifying
+Never let it pick architecture — that's my job
+Use it for boilerplate and repetitive patterns where the spec is clear
+Don't use it for README/documentation — those must be my actual thoughts
+When it produces something I don't understand, that's a red flag, not a feature
+
+What this changes about engineering: the skill shifts from "can you write code" to "can you specify precisely what you want, evaluate what you get, and maintain coherence across a codebase." The project instruction I wrote is arguably the most important artifact in this rep
 
 ## Testing
 
@@ -128,7 +144,7 @@ and `get_ingestion_service` originally took a plain `settings: Settings |
 None = None` parameter for testing convenience. FastAPI's dependency
 resolver doesn't know that's "just a default" — a Pydantic-model-typed
 parameter with no `Depends`/`Query`/`Path` marker is exactly what it treats
-as an *implicit second request-body field*. `POST /chat` and `POST
+as an _implicit second request-body field_. `POST /chat` and `POST
 /documents` were silently expecting `{"request": {...}, "settings": {...}}`
 instead of a flat body, and every unit test up to that point was calling the
 service classes directly, so nothing exercised the actual HTTP request
