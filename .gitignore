@@ -134,3 +134,17 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# --- Python (backend) ---
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# --- App data (uploaded docs, Chroma persistence) ---
+backend/data/
+
+# --- Env files ---
+backend/.env
+
