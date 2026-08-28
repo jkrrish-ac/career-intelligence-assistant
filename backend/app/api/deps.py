@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from fastapi import Depends
+
 from app.core.config import Settings, get_settings
 from app.core.rate_limit import SlidingWindowRateLimiter
 from app.llm.claude_client import ClaudeClient
@@ -73,8 +75,14 @@ def get_conversation_store() -> ConversationStore:
     return ConversationStore(max_turns_per_session=settings.max_history_turns)
 
 
-def get_ingestion_service(settings: Settings | None = None) -> IngestionService:
-    settings = settings or get_settings()
+def get_ingestion_service(settings: Settings = Depends(get_settings)) -> IngestionService:
+    # `settings` MUST be resolved via Depends(get_settings), not a plain
+    # `Settings | None = None` default — a bare BaseModel-typed parameter
+    # with no Depends/Query/Path marker is exactly what FastAPI treats as an
+    # implicit *request body field* on any route that takes this as its own
+    # Depends(...). That bug silently turned POST /documents and /chat's
+    # request bodies into `{"request": {...}, "settings": {...}}` — caught
+    # by tests/test_api_routes.py, which is why those tests exist at all.
     return IngestionService(
         embedding_provider=get_embedding_provider_dep(),
         vector_store=get_vector_store(),
@@ -86,8 +94,7 @@ def get_ingestion_service(settings: Settings | None = None) -> IngestionService:
     )
 
 
-def get_chat_service(settings: Settings | None = None) -> ChatService:
-    settings = settings or get_settings()
+def get_chat_service(settings: Settings = Depends(get_settings)) -> ChatService:
     return ChatService(
         embedding_provider=get_embedding_provider_dep(),
         vector_store=get_vector_store(),
