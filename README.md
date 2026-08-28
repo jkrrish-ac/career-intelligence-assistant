@@ -113,20 +113,34 @@ cd backend && source .venv/bin/activate && pytest -q
 cd frontend && npm run build && npx vitest run
 ```
 
-Backend: 28 tests covering chunking metadata/overlap, the document-type
+Backend: 37 tests covering chunking metadata/overlap, the document-type
 query classifier, BM25+RRF fusion recovering a keyword-strong chunk a
 semantic-only search missed, cross-encoder rerank ordering, conversation
 history (ordering, per-session isolation, eviction once the turn cap is
-hit), and guardrails (no-documents, rate-limit-trip, oversized upload,
-empty/unsupported file) — all run without hitting the network or needing an
-API key (the cross-encoder tests stub the model itself, since they're
-testing the sort/threshold logic, not the model; the chat-service tests use
-fakes for every collaborator, so they test guardrail *ordering* — e.g. that
-a tripped rate limit prevents the LLM from being called at all — rather than
-real retrieval quality). Frontend: a build/type-check pass plus ChatPanel
-tests that drive the same event-callback shape `streamChatMessage` uses in
-production (context → delta → done, and a guardrail `error` event), and
-that the input is disabled until both a resume and a JD are uploaded.
+hit), guardrails (no-documents, rate-limit-trip, oversized upload,
+empty/unsupported file), and route-level integration tests against the real
+FastAPI app (`tests/test_api_routes.py`, via `httpx.ASGITransport` +
+`app.dependency_overrides`) — all run without hitting the network or
+needing an API key.
+
+That last file exists because of a real bug it caught: `get_chat_service`
+and `get_ingestion_service` originally took a plain `settings: Settings |
+None = None` parameter for testing convenience. FastAPI's dependency
+resolver doesn't know that's "just a default" — a Pydantic-model-typed
+parameter with no `Depends`/`Query`/`Path` marker is exactly what it treats
+as an *implicit second request-body field*. `POST /chat` and `POST
+/documents` were silently expecting `{"request": {...}, "settings": {...}}`
+instead of a flat body, and every unit test up to that point was calling the
+service classes directly, so nothing exercised the actual HTTP request
+parsing to notice. Fixed by resolving `settings` via `Depends(get_settings)`
+like everything else in `deps.py` — see the comment in `app/api/deps.py` for
+the full explanation. It's a good example of why route-level tests earn
+their keep even when the unit tests below them are solid.
+
+Frontend: a build/type-check pass plus ChatPanel tests that drive the same
+event-callback shape `streamChatMessage` uses in production (context →
+delta → done, and a guardrail `error` event), and that the input is
+disabled until both a resume and a JD are uploaded.
 
 ## What I'd do with more time
 
