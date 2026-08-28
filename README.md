@@ -111,11 +111,11 @@ My workflow was: I decide the what and why, Claude drafts the how, I review and 
 
 My rules for AI-assisted development:
 
-Never accept generated code without verifying
-Never let it pick architecture — that's my job
-Use it for boilerplate and repetitive patterns where the spec is clear
-Don't use it for README/documentation — those must be my actual thoughts
-When it produces something I don't understand, that's a red flag, not a feature
+- Never accept generated code without verifying
+- Never let it pick architecture — that's my job
+- Use it for boilerplate and repetitive patterns where the spec is clear
+- Don't use it for README/documentation — those must be my actual thoughts
+- When it produces something I don't understand, that's a red flag, not a feature
 
 What this changes about engineering: the skill shifts from "can you write code" to "can you specify precisely what you want, evaluate what you get, and maintain coherence across a codebase." The project instruction I wrote is arguably the most important artifact in this rep
 
