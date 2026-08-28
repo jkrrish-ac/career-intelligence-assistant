@@ -147,3 +147,4 @@ backend/data/
 
 # --- Env files ---
 backend/.env
+.
