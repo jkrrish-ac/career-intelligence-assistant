@@ -60,6 +60,15 @@ class RateLimitExceededError(AppError):
     status_code = status.HTTP_429_TOO_MANY_REQUESTS
 
 
+class DocumentNotFoundError(AppError):
+    """Raised when an operation targets a document_id that isn't registered
+    — e.g. re-indexing (PUT /documents/{id}) a document that was never
+    uploaded or was already deleted."""
+
+    error_code = "document_not_found"
+    status_code = status.HTTP_404_NOT_FOUND
+
+
 class LLMProviderError(AppError):
     error_code = "llm_provider_error"
     status_code = status.HTTP_502_BAD_GATEWAY

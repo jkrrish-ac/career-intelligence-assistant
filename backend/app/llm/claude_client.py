@@ -15,7 +15,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from app.core.exceptions import LLMProviderError
 from app.core.logging import get_logger
-from app.models.schemas import ConversationTurn, RetrievedChunk, SourceType
+from app.models.schemas import ConversationTurn, DocumentMetadata, RetrievedChunk, SourceType
 
 logger = get_logger(__name__)
 
@@ -142,6 +142,70 @@ class ClaudeClient:
             "output_tokens": output_tokens,
             "llm_ms": llm_ms,
         }
+
+    async def classify(self, query: str, known_documents: list[DocumentMetadata]) -> str:
+        """One constrained tool-call asking Claude which uploaded document a
+        question targets, if any. Returns the raw `target` string (a
+        document_id, "resume", "job_description", or "all") -- turning that
+        into the retrieval `where` filter shape is `query_classifier.py`'s
+        job, not this client's, matching the separation of concerns already
+        used for `build_user_message` vs. the API call itself.
+
+        Deliberately NOT wrapped in the `_call` retry policy: this call has
+        a caller-side fallback to the regex heuristic on *any* failure (see
+        `ChatService._resolve_query_target`), and retrying three times with
+        exponential backoff before falling back would make a flaky
+        classifier slower than just not having one. A single fast attempt
+        that fails closed (falls back) beats a slow one that eventually
+        succeeds."""
+        allowed_targets = [d.document_id for d in known_documents] + [
+            SourceType.RESUME.value,
+            SourceType.JOB_DESCRIPTION.value,
+            "all",
+        ]
+        doc_lines = "\n".join(
+            f"- {d.document_id}: {d.label} ({d.source_type.value})" for d in known_documents
+        )
+        tool = {
+            "name": "classify_query_target",
+            "description": "Classify which uploaded document(s) the user's question is about.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "enum": allowed_targets,
+                        "description": (
+                            "The document_id if the question is clearly about one "
+                            "specific uploaded document (e.g. it names a job number "
+                            "or says 'my resume'); 'resume' if it's about the "
+                            "candidate's resume/background in general; "
+                            "'job_description' if it's about job posting(s) in "
+                            "general without naming a specific one; 'all' if the "
+                            "target is unclear or the question could span multiple "
+                            "documents."
+                        ),
+                    }
+                },
+                "required": ["target"],
+            },
+        }
+
+        response = await self._client.messages.create(
+            model=self._model,
+            max_tokens=64,
+            system=(
+                "You route career-assistant questions to the uploaded document(s) "
+                "they're about. Uploaded documents:\n" + (doc_lines or "(none uploaded yet)")
+            ),
+            messages=[{"role": "user", "content": query}],
+            tools=[tool],
+            tool_choice={"type": "tool", "name": "classify_query_target"},
+        )
+        for block in response.content:
+            if block.type == "tool_use":
+                return block.input.get("target", "all")
+        return "all"  # pragma: no cover - defensive; forced tool_choice always returns a tool_use block
 
     async def stream_answer(
         self,

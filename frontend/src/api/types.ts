@@ -3,6 +3,8 @@
 
 export type SourceType = 'resume' | 'job_description'
 
+export type DocumentStatus = 'pending' | 'ready' | 'failed'
+
 export interface DocumentMetadata {
   document_id: string
   source_type: SourceType
@@ -10,6 +12,8 @@ export interface DocumentMetadata {
   filename: string
   uploaded_at: string
   chunk_count: number
+  status: DocumentStatus
+  error_message: string | null
 }
 
 export interface UploadResponse {
@@ -17,6 +21,7 @@ export interface UploadResponse {
   source_type: SourceType
   label: string
   chunk_count: number
+  status: DocumentStatus
 }
 
 export interface SourceRef {

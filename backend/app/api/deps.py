@@ -9,16 +9,16 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from fastapi import Depends
+from fastapi import Depends, Request
 
 from app.core.config import Settings, get_settings
-from app.core.rate_limit import SlidingWindowRateLimiter
+from app.core.rate_limit import RedisRateLimiter, SlidingWindowRateLimiter
 from app.llm.claude_client import ClaudeClient
 from app.rag.embeddings import EmbeddingProvider, get_embedding_provider
 from app.rag.reranker import CrossEncoderReranker, get_reranker
 from app.rag.vector_store import ChromaVectorStore, VectorStore
 from app.services.chat_service import ChatService
-from app.services.conversation_store import ConversationStore
+from app.services.conversation_store import ConversationStore, RedisConversationStore
 from app.services.document_registry import DocumentRegistry
 from app.services.ingestion_service import IngestionService
 
@@ -61,8 +61,27 @@ def get_claude_client() -> ClaudeClient:
 
 
 @lru_cache
-def get_rate_limiter() -> SlidingWindowRateLimiter:
+def get_redis_client():
+    """Only constructed (and only imports `redis.asyncio`) when REDIS_URL is
+    actually set — a machine without Redis running never pays for this or
+    even needs the import to succeed lazily-imported here, not at module
+    load time, so `redis` stays an optional runtime dependency in spirit
+    even though it's now a hard requirements.txt pin."""
+    import redis.asyncio as redis
+
     settings = get_settings()
+    return redis.from_url(settings.redis_url, decode_responses=True)
+
+
+@lru_cache
+def get_rate_limiter() -> SlidingWindowRateLimiter | RedisRateLimiter:
+    settings = get_settings()
+    if settings.redis_url:
+        return RedisRateLimiter(
+            redis_client=get_redis_client(),
+            max_requests=settings.rate_limit_requests,
+            window_seconds=settings.rate_limit_window_seconds,
+        )
     return SlidingWindowRateLimiter(
         max_requests=settings.rate_limit_requests,
         window_seconds=settings.rate_limit_window_seconds,
@@ -70,9 +89,36 @@ def get_rate_limiter() -> SlidingWindowRateLimiter:
 
 
 @lru_cache
-def get_conversation_store() -> ConversationStore:
+def get_conversation_store() -> ConversationStore | RedisConversationStore:
     settings = get_settings()
+    if settings.redis_url:
+        return RedisConversationStore(
+            redis_client=get_redis_client(),
+            max_turns_per_session=settings.max_history_turns,
+            session_ttl_seconds=settings.redis_session_ttl_seconds,
+        )
     return ConversationStore(max_turns_per_session=settings.max_history_turns)
+
+
+async def get_arq_pool(request: Request, settings: Settings = Depends(get_settings)):
+    """Lazily creates one arq (Redis-backed job queue) pool per app process
+    and caches it on `app.state`, so it isn't reconnected on every request.
+    Returns None -- and never touches Redis -- when `INGESTION_MODE` isn't
+    `async`; that's the common case, so this is a no-op for every
+    deployment that hasn't opted into async ingestion (see
+    `app/services/ingestion_service.py::register_pending`/`process_pending`
+    and `app/worker.py` for the rest of that path)."""
+    if settings.ingestion_mode != "async":
+        return None
+
+    pool = getattr(request.app.state, "arq_pool", None)
+    if pool is None:
+        from arq import create_pool
+        from arq.connections import RedisSettings
+
+        pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+        request.app.state.arq_pool = pool
+    return pool
 
 
 def get_ingestion_service(settings: Settings = Depends(get_settings)) -> IngestionService:
@@ -106,4 +152,6 @@ def get_chat_service(settings: Settings = Depends(get_settings)) -> ChatService:
         candidate_k=settings.retrieval_candidate_k,
         final_k=settings.retrieval_final_k,
         rerank_enabled=settings.rerank_enabled,
+        query_classifier_mode=settings.query_classifier_mode,
+        query_classifier_timeout_seconds=settings.query_classifier_timeout_seconds,
     )

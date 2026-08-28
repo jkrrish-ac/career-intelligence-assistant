@@ -12,6 +12,8 @@ const RESUME: DocumentMetadata = {
   filename: 'resume.pdf',
   uploaded_at: new Date().toISOString(),
   chunk_count: 4,
+  status: 'ready',
+  error_message: null,
 }
 
 const JOB_DESCRIPTION: DocumentMetadata = {
@@ -21,6 +23,8 @@ const JOB_DESCRIPTION: DocumentMetadata = {
   filename: 'jd.pdf',
   uploaded_at: new Date().toISOString(),
   chunk_count: 3,
+  status: 'ready',
+  error_message: null,
 }
 
 /** Emits a canned sequence of SSE events through the same callback shape

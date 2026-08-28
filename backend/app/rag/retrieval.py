@@ -21,6 +21,12 @@ from app.rag.vector_store import VectorStore
 
 logger = get_logger(__name__)
 
+# Sentinel distinguishing "caller didn't pass `where`" (compute it with the
+# heuristic, same as always) from "caller passed where=None on purpose"
+# (an LLM classifier's fallback-appropriate way of saying "search
+# everything" — see ChatService._resolve_query_target in chat_service.py).
+_NOT_GIVEN = object()
+
 _RESUME_HINTS = re.compile(
     r"\b(my|i'?ve|i have|our)\b.*\b(experience|background|resume|cv|skills?)\b"
     r"|\bmy resume\b|\bmy experience\b|\bmy skills\b|\bmy background\b",
@@ -79,10 +85,20 @@ async def hybrid_retrieve(
     embedding_provider: EmbeddingProvider,
     vector_store: VectorStore,
     candidate_k: int,
+    where: dict | None = _NOT_GIVEN,  # type: ignore[assignment]
 ) -> list[RetrievedChunk]:
-    """Semantic + BM25 fused candidate set, before reranking."""
+    """Semantic + BM25 fused candidate set, before reranking.
 
-    where = classify_query_target(query, known_documents)
+    `where` is normally left unset, in which case the regex/keyword
+    heuristic (`classify_query_target`) computes it here, same as always.
+    Callers that have already resolved a `where` filter some other way (the
+    LLM-based classifier in `query_classifier.py`, with its own
+    heuristic-on-failure fallback) can pass it in directly — including
+    `where=None` to explicitly mean "search everything," which is why this
+    isn't a plain `where: dict | None = None` default."""
+
+    if where is _NOT_GIVEN:
+        where = classify_query_target(query, known_documents)
 
     # Semantic leg. Embedding + ANN search are blocking CPU calls; offload
     # so they don't stall the event loop under concurrent requests.
