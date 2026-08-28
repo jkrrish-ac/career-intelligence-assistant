@@ -1,4 +1,11 @@
-import type { ApiErrorBody, ChatResponse, DocumentMetadata, SourceType, UploadResponse } from './types'
+import type {
+  ApiErrorBody,
+  ChatResponse,
+  DocumentMetadata,
+  SourceType,
+  StreamEvent,
+  UploadResponse,
+} from './types'
 import { ApiError } from './types'
 
 // Vite dev server proxies /api -> the backend (see vite.config.ts); in
@@ -59,4 +66,57 @@ export async function sendChatMessage(message: string, sessionId?: string): Prom
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message, session_id: sessionId }),
   })
+}
+
+/**
+ * Streams /chat/stream (Server-Sent Events framed as `data: <json>\n\n`)
+ * and invokes `onEvent` for each parsed event as it arrives. Throws ApiError
+ * for a non-2xx HTTP response (e.g. rate limit before the stream even
+ * starts); a guardrail that fires mid-stream instead arrives as a
+ * `{type: 'error'}` event, which the caller handles via onEvent.
+ */
+export async function streamChatMessage(
+  message: string,
+  sessionId: string | undefined,
+  onEvent: (event: StreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(`${BASE_URL}/chat/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, session_id: sessionId }),
+    signal,
+  })
+
+  if (!response.ok || !response.body) {
+    let body: ApiErrorBody | null = null
+    try {
+      body = (await response.json()) as ApiErrorBody
+    } catch {
+      // fall through to generic message below
+    }
+    throw new ApiError(
+      body?.message ?? `Request failed with status ${response.status}`,
+      body?.error_code ?? 'unknown_error',
+      response.status,
+    )
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    const frames = buffer.split('\n\n')
+    buffer = frames.pop() ?? ''
+    for (const frame of frames) {
+      const line = frame.split('\n').find((l) => l.startsWith('data: '))
+      if (!line) continue
+      onEvent(JSON.parse(line.slice('data: '.length)) as StreamEvent)
+    }
+  }
 }

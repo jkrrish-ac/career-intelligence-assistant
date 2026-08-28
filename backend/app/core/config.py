@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     rate_limit_requests: int = Field(default=20, description="Max /chat requests per window")
     rate_limit_window_seconds: int = Field(default=60)
 
+    # --- Conversation memory ---
+    max_history_turns: int = Field(
+        default=10, description="User+assistant turn pairs kept per session, in-memory only"
+    )
+
     # --- Server ---
     cors_allow_origins: tuple[str, ...] = Field(default=("http://localhost:5173",))
     log_level: str = Field(default="INFO")

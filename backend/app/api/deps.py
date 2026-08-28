@@ -16,6 +16,7 @@ from app.rag.embeddings import EmbeddingProvider, get_embedding_provider
 from app.rag.reranker import CrossEncoderReranker, get_reranker
 from app.rag.vector_store import ChromaVectorStore, VectorStore
 from app.services.chat_service import ChatService
+from app.services.conversation_store import ConversationStore
 from app.services.document_registry import DocumentRegistry
 from app.services.ingestion_service import IngestionService
 
@@ -66,6 +67,12 @@ def get_rate_limiter() -> SlidingWindowRateLimiter:
     )
 
 
+@lru_cache
+def get_conversation_store() -> ConversationStore:
+    settings = get_settings()
+    return ConversationStore(max_turns_per_session=settings.max_history_turns)
+
+
 def get_ingestion_service(settings: Settings | None = None) -> IngestionService:
     settings = settings or get_settings()
     return IngestionService(
@@ -88,6 +95,7 @@ def get_chat_service(settings: Settings | None = None) -> ChatService:
         document_registry=get_document_registry(),
         claude_client=get_claude_client(),
         rate_limiter=get_rate_limiter(),
+        conversation_store=get_conversation_store(),
         candidate_k=settings.retrieval_candidate_k,
         final_k=settings.retrieval_final_k,
         rerank_enabled=settings.rerank_enabled,
