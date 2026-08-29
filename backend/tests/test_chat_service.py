@@ -11,12 +11,12 @@ from app.services.conversation_store import ConversationStore
 
 
 class _NoopRateLimiter:
-    def check(self, key: str) -> None:
+    async def check(self, key: str) -> None:
         return None
 
 
 class _TrippedRateLimiter:
-    def check(self, key: str) -> None:
+    async def check(self, key: str) -> None:
         raise RateLimitExceededError("too many requests")
 
 

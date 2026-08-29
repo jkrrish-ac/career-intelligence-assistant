@@ -1,4 +1,17 @@
 services:
+  redis:
+    image: redis:7-alpine
+    # No persistence volume: conversation memory and rate-limit counters are
+    # ephemeral/cache-like state, not source-of-truth data (that's Chroma +
+    # documents.json, both under backend_data). Losing this on a Redis
+    # restart just means sessions start fresh, same as today's in-memory
+    # default — it's the *backend* restarting that this is meant to survive.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   backend:
     build: ./backend
     ports:
@@ -10,17 +23,44 @@ services:
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
       - RERANKER_MODEL=${RERANKER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
       - RERANK_ENABLED=${RERANK_ENABLED:-true}
+      - QUERY_CLASSIFIER_MODE=${QUERY_CLASSIFIER_MODE:-llm}
+      - INGESTION_MODE=${INGESTION_MODE:-sync}
       - CHROMA_PERSIST_DIR=/app/data/chroma
       - UPLOAD_DIR=/app/data/uploads
       - CORS_ALLOW_ORIGINS=["http://localhost:3000"]
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - REDIS_URL=redis://redis:6379/0
     volumes:
       - backend_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  worker:
+    # Same image as `backend` -- the arq worker imports the exact same
+    # ingestion pipeline (see app/worker.py), it just runs it out of the
+    # request path. Only does anything when INGESTION_MODE=async; harmless
+    # to leave running otherwise (it just sits idle waiting for jobs that
+    # never arrive in sync mode).
+    build: ./backend
+    command: ["arq", "app.worker.WorkerSettings"]
+    environment:
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-local}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - CHROMA_PERSIST_DIR=/app/data/chroma
+      - UPLOAD_DIR=/app/data/uploads
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - backend_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
 
   frontend:
     build: ./frontend

@@ -5,6 +5,16 @@ without loading vectors, so document-level metadata (label, upload time,
 chunk count) lives in its own small JSON-backed store. Simple by design —
 a take-home doesn't need a second database for a handful of documents, and
 this is the kind of scope call worth naming rather than justifying at length.
+
+Known gap since the arq worker (app/worker.py) started sharing this file
+across processes: `threading.Lock` only serializes writes *within* one
+process. The backend and worker processes both read-modify-write the same
+documents.json with no cross-process lock, so a status update from the
+worker landing at the same instant as a new upload from the backend could
+lose one of the two writes. Low-probability for a take-home's traffic, and
+named here rather than silently assumed — the real fix is a proper database
+(or at least a file lock/atomic rename), which is more machinery than this
+scope calls for.
 """
 
 from __future__ import annotations
@@ -54,3 +64,21 @@ class DocumentRegistry:
         with self._lock:
             self._documents.pop(document_id, None)
             self._persist()
+
+    def update(self, document: DocumentMetadata) -> None:
+        """Replace an existing entry in place, keyed by its (unchanged)
+        document_id — used by re-indexing, where the document_id is
+        preserved across a delete+re-add of its chunks so the document
+        doesn't lose its position in the list or its id-based references
+        elsewhere (e.g. `classify_query_target`'s job-number filter).
+
+        Raises KeyError if `document_id` isn't already registered — callers
+        that need a client-facing 404 should check `get()` first (see
+        `IngestionService.reindex_document`), since this is an internal
+        registry primitive, not the HTTP-facing guardrail itself."""
+        with self._lock:
+            if document.document_id not in self._documents:
+                raise KeyError(document.document_id)
+            self._documents[document.document_id] = document
+            self._persist()
+        logger.info("document_updated", document_id=document.document_id, label=document.label)

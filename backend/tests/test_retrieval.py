@@ -1,7 +1,7 @@
 import pytest
 
 from app.models.schemas import Chunk, DocumentMetadata, SourceType
-from app.rag.retrieval import classify_query_target, hybrid_retrieve
+from app.rag.retrieval import _ensure_resume_included, classify_query_target, hybrid_retrieve
 from app.rag.embeddings import EmbeddingProvider
 from app.rag.vector_store import VectorStore
 from datetime import UTC, datetime
@@ -60,6 +60,38 @@ def test_classify_query_target_never_targets_unknown_job_number():
     assert where is None
 
 
+# --- _ensure_resume_included -------------------------------------------------
+# Regression coverage for a real bug: classify_query_target's JD-narrowing
+# filters were applied to *both* legs of retrieval with no guard, so a
+# gap-analysis/alignment question -- this app's core use case -- could
+# retrieve zero resume chunks and Claude would (correctly, given empty
+# context) say the resume was never provided.
+
+
+def test_ensure_resume_included_leaves_none_untouched():
+    assert _ensure_resume_included(None, _KNOWN_DOCS) is None
+
+
+def test_ensure_resume_included_leaves_resume_only_filter_untouched():
+    where = {"source_type": "resume"}
+    assert _ensure_resume_included(where, _KNOWN_DOCS) == where
+
+
+def test_ensure_resume_included_ors_in_resume_for_a_source_type_jd_filter():
+    where = _ensure_resume_included({"source_type": "job_description"}, _KNOWN_DOCS)
+    assert where == {"$or": [{"source_type": "resume"}, {"source_type": "job_description"}]}
+
+
+def test_ensure_resume_included_ors_in_resume_for_a_specific_jd_document_id():
+    where = _ensure_resume_included({"document_id": "jd-2"}, _KNOWN_DOCS)
+    assert where == {"$or": [{"source_type": "resume"}, {"document_id": "jd-2"}]}
+
+
+def test_ensure_resume_included_leaves_a_resume_document_id_filter_untouched():
+    where = {"document_id": "resume-1"}
+    assert _ensure_resume_included(where, _KNOWN_DOCS) == where
+
+
 # --- hybrid_retrieve (RRF fusion) ------------------------------------------
 
 
@@ -105,6 +137,79 @@ class _FakeVectorStore(VectorStore):
 
     def delete_document(self, document_id: str) -> None:
         raise NotImplementedError
+
+
+class _FilteringVectorStore(VectorStore):
+    """Unlike `_FakeVectorStore` above, this one actually respects `where`
+    the way `ChromaVectorStore` does (including `$or`) -- needed to catch a
+    bug at the retrieval-filtering layer rather than the classifier layer."""
+
+    def __init__(self, chunks: list[Chunk]) -> None:
+        self._chunks = chunks
+
+    @staticmethod
+    def _matches(chunk: Chunk, where: dict | None) -> bool:
+        if where is None:
+            return True
+        if "$or" in where:
+            return any(_FilteringVectorStore._matches(chunk, clause) for clause in where["$or"])
+        for key, value in where.items():
+            attr = getattr(chunk, key)
+            attr = attr.value if hasattr(attr, "value") else attr
+            if attr != value:
+                return False
+        return True
+
+    def add(self, chunks, embeddings) -> None:
+        raise NotImplementedError
+
+    def query(self, query_embedding, top_k, where=None):
+        matched = [c for c in self._chunks if self._matches(c, where)]
+        return [(c, 1.0) for c in matched[:top_k]]
+
+    def get_all_chunks(self, where=None) -> list[Chunk]:
+        return [c for c in self._chunks if self._matches(c, where)]
+
+    def delete_document(self, document_id: str) -> None:
+        raise NotImplementedError
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieve_keeps_resume_chunks_when_query_targets_a_specific_jd():
+    resume_chunk = _chunk("c-resume", "Five years of Python and FastAPI experience.")
+    jd2_chunk = Chunk(
+        chunk_id="c-jd2",
+        document_id="jd-2",
+        source_type=SourceType.JOB_DESCRIPTION,
+        label="Job #2",
+        section=None,
+        text="Requires Kubernetes and Terraform experience.",
+    )
+    jd1_chunk = Chunk(
+        chunk_id="c-jd1",
+        document_id="jd-1",
+        source_type=SourceType.JOB_DESCRIPTION,
+        label="Job #1",
+        section=None,
+        text="Requires frontend React experience.",
+    )
+    store = _FilteringVectorStore([resume_chunk, jd2_chunk, jd1_chunk])
+
+    results = await hybrid_retrieve(
+        query="How does my experience align with Job #2?",
+        known_documents=_KNOWN_DOCS,
+        embedding_provider=_FakeEmbeddingProvider(),
+        vector_store=store,
+        candidate_k=10,
+    )
+
+    result_ids = {r.chunk.chunk_id for r in results}
+    assert "c-jd2" in result_ids, "the targeted JD's chunks should still be retrieved"
+    assert "c-resume" in result_ids, (
+        "resume chunks must not be excluded just because the query names a specific "
+        "JD -- this is a resume-vs-JD comparison question and needs both sides"
+    )
+    assert "c-jd1" not in result_ids, "the *other* JD should still be filtered out"
 
 
 @pytest.mark.asyncio
