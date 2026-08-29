@@ -83,9 +83,24 @@ describe('ChatPanel', () => {
       expect(screen.getByText(/missing hands-on kubernetes/i)).toBeInTheDocument(),
     )
 
-    expect(screen.getByText('Job #1')).toBeInTheDocument()
-    expect(screen.getByText(/rerank 4\.21/)).toBeInTheDocument()
-    expect(screen.getByText(/512\+96 tokens/)).toBeInTheDocument()
+    expect(screen.getByText(/based on/i)).toBeInTheDocument()
+    // "Job #1" appears both in the "Based on…" summary and in the source
+    // chip itself — the chip is the second occurrence in document order.
+    const jobLabelMentions = screen.getAllByText('Job #1')
+    expect(jobLabelMentions).toHaveLength(2)
+
+    // The rerank score (4.21) is above the "strong match" threshold, and is
+    // shown as a plain-English pill by default — the exact number is one
+    // click away in the expanded panel.
+    expect(screen.getByText('Strong match')).toBeInTheDocument()
+    await userEvent.click(jobLabelMentions[1])
+    expect(screen.getByText(/rerank score: 4\.2100/)).toBeInTheDocument()
+
+    // Timing/token stats are tucked behind a collapsed "answer details"
+    // toggle instead of always-visible monospace text.
+    expect(screen.queryByText(/512.*96/)).not.toBeInTheDocument()
+    await userEvent.click(screen.getByText(/show answer details/i))
+    expect(screen.getByText(/512 in \/ 96 out/)).toBeInTheDocument()
   })
 
   it('surfaces a guardrail error event without crashing', async () => {
