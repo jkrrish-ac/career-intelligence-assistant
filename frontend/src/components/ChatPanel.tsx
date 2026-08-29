@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
-import { AlertTriangle, Loader2, Send, Sparkles } from 'lucide-react'
-import type { DocumentMetadata, SourceRef, TimingInfo, TokenUsage } from '../api/types'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { AlertTriangle, ChevronDown, Loader2, Send, Sparkles } from 'lucide-react'
+import type { DocumentMetadata, SourceRef, SourceType, TimingInfo, TokenUsage } from '../api/types'
 import { ApiError } from '../api/types'
 import { streamChatMessage } from '../api/client'
 import { SourceChip } from './SourceChip'
+import { MarkdownAnswer } from './MarkdownAnswer'
 import { Button } from './ui/Button'
+import { cn } from '../lib/cn'
 
 interface ChatMessage {
   id: string
@@ -30,6 +32,12 @@ export function ChatPanel({ documents }: { documents: DocumentMetadata[] }) {
   const [loading, setLoading] = useState(false)
   const sessionId = useRef(crypto.randomUUID())
   const abortRef = useRef<AbortController | null>(null)
+
+  const docTypeById = useMemo(() => {
+    const map = new Map<string, SourceType>()
+    for (const doc of documents) map.set(doc.document_id, doc.source_type)
+    return map
+  }, [documents])
 
   useEffect(() => () => abortRef.current?.abort(), [])
 
@@ -102,7 +110,7 @@ export function ChatPanel({ documents }: { documents: DocumentMetadata[] }) {
       <div className="flex-1 space-y-4 overflow-y-auto p-4">
         {messages.length === 0 && <EmptyState canChat={canChat} onPick={handleSend} />}
         {messages.map((message) => (
-          <MessageBubble key={message.id} message={message} />
+          <MessageBubble key={message.id} message={message} docTypeById={docTypeById} />
         ))}
       </div>
 
@@ -157,19 +165,47 @@ function EmptyState({ canChat, onPick }: { canChat: boolean; onPick: (text: stri
   )
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+/** "your resume, Job #1, and Job #2" — a single plain-English sentence
+ * fragment summarizing which uploaded documents actually grounded this
+ * answer, so a user gets the gist before they ever look at (or need to
+ * look at) an individual source chip. */
+function summarizeSources(sources: SourceRef[], docTypeById: Map<string, SourceType>): string {
+  const seen = new Set<string>()
+  const parts: string[] = []
+
+  for (const source of sources) {
+    if (seen.has(source.document_id)) continue
+    seen.add(source.document_id)
+    const type = docTypeById.get(source.document_id)
+    parts.push(type === 'resume' ? 'your resume' : source.label)
+  }
+
+  if (parts.length === 0) return ''
+  if (parts.length === 1) return parts[0]
+  if (parts.length === 2) return `${parts[0]} and ${parts[1]}`
+  return `${parts.slice(0, -1).join(', ')}, and ${parts[parts.length - 1]}`
+}
+
+function MessageBubble({
+  message,
+  docTypeById,
+}: {
+  message: ChatMessage
+  docTypeById: Map<string, SourceType>
+}) {
   const isUser = message.role === 'user'
   const isThinking = message.streaming && !message.content && !message.error
+  const hasSources = !isUser && !message.error && !!message.sources && message.sources.length > 0
 
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
       <div className={`max-w-[85%] space-y-2 ${isUser ? 'items-end' : 'items-start'}`}>
         <div
-          className={`rounded-xl px-3 py-2 text-sm whitespace-pre-wrap ${
+          className={`rounded-xl px-3 py-2 text-sm ${
             isUser
-              ? 'bg-[var(--color-accent)] text-white'
+              ? 'bg-[var(--color-accent)] text-white whitespace-pre-wrap'
               : message.error
-                ? 'bg-[var(--color-danger)]/10 text-[var(--color-danger)]'
+                ? 'bg-[var(--color-danger)]/10 text-[var(--color-danger)] whitespace-pre-wrap'
                 : 'bg-[var(--color-surface)] text-[var(--color-text-primary)]'
           }`}
         >
@@ -181,44 +217,89 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           ) : isThinking ? (
             <span className="flex items-center gap-2 text-[var(--color-text-secondary)]">
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              Retrieving context and asking Claude…
+              Reading your documents and asking Claude…
             </span>
+          ) : isUser ? (
+            message.content
           ) : (
             <>
-              {message.content}
+              <MarkdownAnswer content={message.content} />
               {message.streaming && <span className="animate-pulse">▍</span>}
             </>
           )}
         </div>
 
-        {!isUser && !message.error && message.sources && message.sources.length > 0 && (
-          <div className="space-y-1.5">
+        {hasSources && (
+          <div className="space-y-2">
             {message.grounded === false && (
-              <p className="text-[10px] text-[var(--color-text-secondary)]">
-                ⚠ Low-confidence match — the documents may not fully cover this question.
-              </p>
+              <div className="flex items-start gap-2 rounded-lg bg-[var(--color-warning)]/10 px-2.5 py-2 text-xs text-[var(--color-warning)]">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>
+                  This answer may not be well supported by your documents — the closest match was
+                  weak, so double-check it against the source material yourself.
+                </span>
+              </div>
             )}
+
             <div className="space-y-1">
-              <p className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-text-secondary)]">
-                Sources
+              <p className="text-[10px] text-[var(--color-text-secondary)]">
+                Based on <span className="text-[var(--color-text-primary)]">
+                  {summarizeSources(message.sources!, docTypeById)}
+                </span>
               </p>
               <div className="flex flex-col gap-1">
-                {message.sources.map((source, i) => (
+                {message.sources!.map((source, i) => (
                   <SourceChip key={`${source.document_id}-${i}`} source={source} />
                 ))}
               </div>
             </div>
+
             {message.timing && message.tokenUsage && (
-              <p className="font-mono text-[10px] text-[var(--color-text-secondary)]">
-                retrieval {message.timing.retrieval_ms}ms
-                {message.timing.rerank_ms !== null && ` · rerank ${message.timing.rerank_ms}ms`} · llm{' '}
-                {message.timing.llm_ms}ms · {message.tokenUsage.input_tokens}+
-                {message.tokenUsage.output_tokens} tokens
-              </p>
+              <AnswerDetails timing={message.timing} tokenUsage={message.tokenUsage} />
             )}
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+/** Retrieval/rerank/LLM timings and token counts are real engineering
+ * signal (and worth keeping, per PRD §7's retrieval-transparency goal) but
+ * they're not something a candidate asking about their own resume needs to
+ * see by default — tucked behind one small toggle instead of a permanent
+ * monospace line, in plain English rather than internal stage names. */
+function AnswerDetails({ timing, tokenUsage }: { timing: TimingInfo; tokenUsage: TokenUsage }) {
+  const [expanded, setExpanded] = useState(false)
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex items-center gap-1 text-[10px] text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
+      >
+        <ChevronDown className={cn('h-3 w-3 transition-transform', { 'rotate-180': expanded })} />
+        {expanded ? 'Hide' : 'Show'} answer details
+      </button>
+      {expanded && (
+        <dl className="mt-1.5 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[10px] text-[var(--color-text-secondary)]">
+          <dt>Searching your documents</dt>
+          <dd className="text-right font-mono">{timing.retrieval_ms}ms</dd>
+          {timing.rerank_ms !== null && (
+            <>
+              <dt>Ranking the results</dt>
+              <dd className="text-right font-mono">{timing.rerank_ms}ms</dd>
+            </>
+          )}
+          <dt>Writing the answer</dt>
+          <dd className="text-right font-mono">{timing.llm_ms}ms</dd>
+          <dt>Tokens used</dt>
+          <dd className="text-right font-mono">
+            {tokenUsage.input_tokens} in / {tokenUsage.output_tokens} out
+          </dd>
+        </dl>
+      )}
     </div>
   )
 }

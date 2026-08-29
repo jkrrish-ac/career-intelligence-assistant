@@ -1,10 +1,15 @@
 """Hybrid retrieval: semantic (Chroma) + keyword (BM25), merged via
-reciprocal rank fusion, with a heuristic document-type filter applied first.
+reciprocal rank fusion, with a document-type filter applied first (either the
+regex/keyword heuristic below, or the LLM-based classifier in
+`query_classifier.py` — see `hybrid_retrieve`'s `where` parameter).
 
-The document-type filter is a deliberately simple keyword classifier, not an
-LLM call — cheap, fast, and it's applied *additively*: if it can't confidently
-tell what the query is about, it searches everything rather than risking a
-false-narrow filter that returns nothing (see PRD §11 risks).
+The filter narrows *which job description* a query is about; it must never
+exclude the resume, since virtually every real question here (gap analysis,
+"how does my experience align with Job #2") is a resume-vs-JD comparison —
+see `_ensure_resume_included`, which is what actually makes the filter
+additive rather than exclusionary. If the target is ambiguous, `where` is
+`None` and the search covers everything, same principle, one level up (see
+PRD §11 risks).
 """
 
 from __future__ import annotations
@@ -20,6 +25,12 @@ from app.rag.embeddings import EmbeddingProvider
 from app.rag.vector_store import VectorStore
 
 logger = get_logger(__name__)
+
+# Sentinel distinguishing "caller didn't pass `where`" (compute it with the
+# heuristic, same as always) from "caller passed where=None on purpose"
+# (an LLM classifier's fallback-appropriate way of saying "search
+# everything" — see ChatService._resolve_query_target in chat_service.py).
+_NOT_GIVEN = object()
 
 _RESUME_HINTS = re.compile(
     r"\b(my|i'?ve|i have|our)\b.*\b(experience|background|resume|cv|skills?)\b"
@@ -55,6 +66,38 @@ def classify_query_target(query: str, known_documents: list[DocumentMetadata]) -
     return None
 
 
+def _ensure_resume_included(where: dict | None, known_documents: list[DocumentMetadata]) -> dict | None:
+    """Narrowing a query to "this JD" or "job descriptions in general" must
+    never mean *excluding the resume* — almost every real question this app
+    answers (gap analysis, "how does my experience align with Job #2") is a
+    resume-vs-JD comparison, so a `where` that filters the resume out of the
+    candidate pool entirely makes the question unanswerable even though the
+    resume was uploaded. (This was a real bug: `classify_query_target`
+    documented exactly this narrowing as intended in
+    `tests/test_retrieval.py::test_classify_query_target_resume_hint`, and
+    `hybrid_retrieve` applied it to both the semantic and BM25 legs with no
+    guard.)
+
+    A query that's genuinely resume-only (`{"source_type": "resume"}`, or a
+    `document_id` filter that already names a resume) is left untouched —
+    only a JD-targeting filter gets OR'd with an explicit resume clause so
+    both sides stay in context. Chroma's `where` supports `$or` natively
+    (see `ChromaVectorStore` in `vector_store.py`), so this is a metadata
+    filter change, not a second query."""
+    if where is None:
+        return None
+    if where.get("source_type") == SourceType.RESUME.value:
+        return where
+
+    target_document_id = where.get("document_id")
+    if target_document_id is not None:
+        target_doc = next((d for d in known_documents if d.document_id == target_document_id), None)
+        if target_doc is not None and target_doc.source_type == SourceType.RESUME:
+            return where  # already resume-scoped; nothing to add
+
+    return {"$or": [{"source_type": SourceType.RESUME.value}, where]}
+
+
 def _tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9+.#]+", text.lower())
 
@@ -79,10 +122,21 @@ async def hybrid_retrieve(
     embedding_provider: EmbeddingProvider,
     vector_store: VectorStore,
     candidate_k: int,
+    where: dict | None = _NOT_GIVEN,  # type: ignore[assignment]
 ) -> list[RetrievedChunk]:
-    """Semantic + BM25 fused candidate set, before reranking."""
+    """Semantic + BM25 fused candidate set, before reranking.
 
-    where = classify_query_target(query, known_documents)
+    `where` is normally left unset, in which case the regex/keyword
+    heuristic (`classify_query_target`) computes it here, same as always.
+    Callers that have already resolved a `where` filter some other way (the
+    LLM-based classifier in `query_classifier.py`, with its own
+    heuristic-on-failure fallback) can pass it in directly — including
+    `where=None` to explicitly mean "search everything," which is why this
+    isn't a plain `where: dict | None = None` default."""
+
+    if where is _NOT_GIVEN:
+        where = classify_query_target(query, known_documents)
+    where = _ensure_resume_included(where, known_documents)
 
     # Semantic leg. Embedding + ANN search are blocking CPU calls; offload
     # so they don't stall the event loop under concurrent requests.

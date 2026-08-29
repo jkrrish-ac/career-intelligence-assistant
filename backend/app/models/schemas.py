@@ -37,6 +37,14 @@ class DocumentMetadata(BaseModel):
     filename: str
     uploaded_at: datetime
     chunk_count: int = 0
+    # "ready" is the default because most callers (ingest_document,
+    # reindex_document) still finish the whole pipeline before ever
+    # constructing this -- only the async ingestion path (register_pending,
+    # in ingestion_service.py) creates one that starts out "pending".
+    status: Literal["pending", "ready", "failed"] = "ready"
+    error_message: str | None = Field(
+        default=None, description="Set when status is 'failed' -- why ingestion didn't finish"
+    )
 
 
 class Chunk(BaseModel):
@@ -61,6 +69,7 @@ class UploadResponse(BaseModel):
     source_type: SourceType
     label: str
     chunk_count: int
+    status: Literal["pending", "ready", "failed"] = "ready"
 
 
 class ChatRequest(BaseModel):

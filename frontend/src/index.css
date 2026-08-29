@@ -12,6 +12,8 @@
   --color-resume: #22c55e;
   --color-jd: #38bdf8;
   --color-danger: #f87171;
+  --color-warning: #f59e0b;
+  --color-success: #22c55e;
 }
 
 body {

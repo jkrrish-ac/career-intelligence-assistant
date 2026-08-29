@@ -5,26 +5,29 @@ themselves stay a thin translation to/from HTTP (or SSE).
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 
 from app.core.exceptions import NoDocumentsUploadedError
 from app.core.logging import get_logger
-from app.core.rate_limit import SlidingWindowRateLimiter
+from app.core.rate_limit import RedisRateLimiter, SlidingWindowRateLimiter
 from app.llm.claude_client import ClaudeClient
 from app.models.schemas import (
     ChatResponse,
     ConversationTurn,
+    DocumentMetadata,
     RetrievedChunk,
     SourceRef,
     TimingInfo,
     TokenUsage,
 )
 from app.rag.embeddings import EmbeddingProvider
+from app.rag.query_classifier import classify_query_target_llm
 from app.rag.reranker import CrossEncoderReranker, rerank_candidates
-from app.rag.retrieval import hybrid_retrieve
+from app.rag.retrieval import classify_query_target, hybrid_retrieve
 from app.rag.vector_store import VectorStore
-from app.services.conversation_store import ConversationStore
+from app.services.conversation_store import ConversationStore, RedisConversationStore
 from app.services.document_registry import DocumentRegistry
 
 logger = get_logger(__name__)
@@ -47,11 +50,13 @@ class ChatService:
         reranker: CrossEncoderReranker,
         document_registry: DocumentRegistry,
         claude_client: ClaudeClient,
-        rate_limiter: SlidingWindowRateLimiter,
-        conversation_store: ConversationStore,
+        rate_limiter: SlidingWindowRateLimiter | RedisRateLimiter,
+        conversation_store: ConversationStore | RedisConversationStore,
         candidate_k: int,
         final_k: int,
         rerank_enabled: bool,
+        query_classifier_mode: str = "llm",
+        query_classifier_timeout_seconds: float = 3.0,
     ) -> None:
         self._embedding_provider = embedding_provider
         self._vector_store = vector_store
@@ -63,19 +68,50 @@ class ChatService:
         self._candidate_k = candidate_k
         self._final_k = final_k
         self._rerank_enabled = rerank_enabled
+        self._query_classifier_mode = query_classifier_mode
+        self._query_classifier_timeout_seconds = query_classifier_timeout_seconds
+
+    async def _resolve_query_target(
+        self, message: str, known_documents: list[DocumentMetadata]
+    ) -> dict | None:
+        """Picks the `where` filter passed to `hybrid_retrieve`. Tries the
+        LLM classifier first (bounded by a timeout so a slow Claude response
+        never becomes a slow chat response), falling back to the regex
+        heuristic on *any* problem -- timeout, API error, malformed output.
+        The heuristic is deliberately never removed; it's the safety net
+        that makes the LLM path low-risk to run by default."""
+        if self._query_classifier_mode != "llm":
+            return classify_query_target(message, known_documents)
+
+        try:
+            where = await asyncio.wait_for(
+                classify_query_target_llm(message, known_documents, self._claude_client),
+                timeout=self._query_classifier_timeout_seconds,
+            )
+            logger.info("query_classified_via_llm", where=where)
+            return where
+        except Exception as exc:
+            logger.warning(
+                "query_classifier_llm_failed_using_heuristic",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return classify_query_target(message, known_documents)
 
     async def _prepare_context(
         self, *, message: str, session_id: str | None
     ) -> tuple[list[RetrievedChunk], float, float | None, bool]:
         """Guardrails + hybrid retrieve + rerank — the part identical
         between the plain and streaming chat paths."""
-        self._rate_limiter.check(key=session_id or "anonymous")
+        await self._rate_limiter.check(key=session_id or "anonymous")
 
         known_documents = self._document_registry.list_all()
         if not known_documents:
             raise NoDocumentsUploadedError(
                 "Upload at least a resume and one job description before asking questions."
             )
+
+        where = await self._resolve_query_target(message, known_documents)
 
         retrieval_start = time.perf_counter()
         candidates = await hybrid_retrieve(
@@ -84,6 +120,7 @@ class ChatService:
             embedding_provider=self._embedding_provider,
             vector_store=self._vector_store,
             candidate_k=self._candidate_k,
+            where=where,
         )
         retrieval_ms = round((time.perf_counter() - retrieval_start) * 1000, 2)
 
@@ -123,25 +160,25 @@ class ChatService:
             for c in final_chunks
         ]
 
-    def _history_for(self, session_id: str | None) -> list[ConversationTurn]:
+    async def _history_for(self, session_id: str | None) -> list[ConversationTurn]:
         if not session_id:
             return []
-        return self._conversation_store.get_history(session_id)
+        return await self._conversation_store.get_history(session_id)
 
-    def _record_turn(self, session_id: str | None, question: str, answer: str) -> None:
+    async def _record_turn(self, session_id: str | None, question: str, answer: str) -> None:
         if not session_id:
             return
-        self._conversation_store.append(session_id, "user", question)
-        self._conversation_store.append(session_id, "assistant", answer)
+        await self._conversation_store.append(session_id, "user", question)
+        await self._conversation_store.append(session_id, "assistant", answer)
 
     async def answer_question(self, *, message: str, session_id: str | None) -> ChatResponse:
         final_chunks, retrieval_ms, rerank_ms, grounded = await self._prepare_context(
             message=message, session_id=session_id
         )
-        history = self._history_for(session_id)
+        history = await self._history_for(session_id)
 
         llm_result = await self._claude_client.answer(message, final_chunks, history)
-        self._record_turn(session_id, message, llm_result["answer"])
+        await self._record_turn(session_id, message, llm_result["answer"])
 
         logger.info(
             "chat_answered",
@@ -177,7 +214,7 @@ class ChatService:
         final_chunks, retrieval_ms, rerank_ms, grounded = await self._prepare_context(
             message=message, session_id=session_id
         )
-        history = self._history_for(session_id)
+        history = await self._history_for(session_id)
         sources = self._to_sources(final_chunks)
 
         yield {"type": "context", "sources": [s.model_dump() for s in sources], "grounded": grounded}
@@ -188,7 +225,7 @@ class ChatService:
                 answer_text += event["text"]
                 yield {"type": "delta", "text": event["text"]}
             else:  # "done"
-                self._record_turn(session_id, message, event["answer"])
+                await self._record_turn(session_id, message, event["answer"])
                 logger.info(
                     "chat_stream_answered",
                     message=message,
